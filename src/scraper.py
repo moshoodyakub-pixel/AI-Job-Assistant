@@ -57,21 +57,15 @@ NIGERIA_LOCATION_TERMS = (
 
 
 def _normalise_location(value):
-    """Return a compact, lowercase location string for matching."""
     return re.sub(r"\s+", " ", (value or "").strip().lower())
 
 
 def _is_nigeria_location(location):
-    """Best-effort check for Nigerian locations returned by job sources."""
     normalised = _normalise_location(location)
     return any(term in normalised for term in NIGERIA_LOCATION_TERMS)
 
 
 def _classify_market(actual_location, requested_market):
-    """
-    Keep Nigerian jobs in the primary market even if they were discovered
-    during a broader remote search. Everything else keeps the requested bucket.
-    """
     if _is_nigeria_location(actual_location):
         return "Nigeria", 1
 
@@ -82,11 +76,8 @@ def _classify_market(actual_location, requested_market):
 
 
 def _extract_linkedin_location(card):
-    """Extract the location displayed on a LinkedIn public job card."""
     location_tag = card.select_one(".job-search-card__location")
-
     if location_tag is None:
-        # Fallback for minor LinkedIn markup changes.
         location_tag = card.select_one("span[class*='location']")
 
     if location_tag is None:
@@ -98,16 +89,17 @@ def _extract_linkedin_location(card):
 def fetch_linkedin_jobs(
     keyword,
     location="Nigeria",
-    max_results=30,
+    max_results=20,
     market="Nigeria",
     remote_only=False,
 ):
     """
-    Scrape public LinkedIn job listings with pagination, rate-limiting,
-    error handling, and a 24-hour time filter.
+    Scrape public LinkedIn job listings from the last 24 hours.
 
-    `Location` is the location shown on the LinkedIn job card. `SearchLocation`
-    records the location used in the search so the two are never confused.
+    `Location` is the actual location shown on the LinkedIn card, while
+    `SearchLocation` records the search geography used to discover the role.
+    `max_results` is enforced exactly so remote fallback searches cannot flood
+    the pipeline.
     """
     endpoint = (
         "https://www.linkedin.com/jobs-guest/jobs/api/"
@@ -125,7 +117,7 @@ def fetch_linkedin_jobs(
     jobs = []
     start = 0
 
-    while start < max_results:
+    while start < max_results and len(jobs) < max_results:
         params = {
             "keywords": keyword,
             "location": location,
@@ -133,7 +125,6 @@ def fetch_linkedin_jobs(
             "start": start,
         }
 
-        # LinkedIn's work-type filter: 2 = remote.
         if remote_only:
             params["f_WT"] = "2"
 
@@ -161,6 +152,9 @@ def fetch_linkedin_jobs(
             break
 
         for card in job_cards:
+            if len(jobs) >= max_results:
+                break
+
             title_tag = card.find("h3", class_="base-search-card__title")
             company_tag = card.find("h4", class_="base-search-card__subtitle")
             link_tag = card.find("a", class_="base-card__full-link")
@@ -191,11 +185,13 @@ def fetch_linkedin_jobs(
     return jobs
 
 
-def fetch_google_jobs(api_key=None):
+def fetch_google_jobs(api_key=None, include_international_remote=False, remote_limit=5):
     """
-    Query SerpApi for Google Jobs in priority order:
-    1. Nigeria roles (primary market).
-    2. Worldwide remote roles (secondary market).
+    Search Google Jobs with Nigeria as the default and dominant market.
+
+    The Nigeria query intentionally uses common employer titles/phrases rather
+    than highly specialised portfolio terminology. International remote results
+    are only fetched when the caller explicitly requests a fallback.
     """
     key = api_key or os.getenv("SERPAPI_KEY")
     if not key:
@@ -205,39 +201,60 @@ def fetch_google_jobs(api_key=None):
         )
         return []
 
-    base_query = (
-        '("Mini-Grid" OR "Microgrid" OR "Solar") '
-        '("Power Systems Engineer" OR "Design" OR "ETAP" '
-        'OR "HOMER Pro" OR "PVsyst")'
+    nigeria_query = (
+        '("Solar Engineer" OR "Electrical Engineer" OR "Renewable Energy Engineer" '
+        'OR "Power Systems Engineer" OR "Solar PV Engineer" OR "Mini-Grid Engineer" '
+        'OR "Electrical Design Engineer" OR "Project Engineer" OR "O&M Engineer" '
+        'OR "Energy Analyst" OR "Distribution Engineer" OR "Energy Systems Engineer") '
+        '(solar OR renewable OR power OR electrical OR grid OR energy OR BESS)'
     )
-    google_jobs = []
 
-    params_nigeria = {
-        "engine": "google_jobs",
-        "q": base_query,
-        "location": "Nigeria",
-        "hl": "en",
-        "api_key": key,
-    }
-
-    params_remote = {
-        "engine": "google_jobs",
-        "q": base_query + ' "Remote"',
-        "ltype": "1",
-        "hl": "en",
-        "api_key": key,
-    }
+    remote_query = (
+        '("Power Systems Engineer" OR "Renewable Energy Engineer" OR "Solar Engineer") '
+        '(solar OR renewable OR grid OR energy) "Remote"'
+    )
 
     searches = [
-        ("Nigeria", "Nigeria", params_nigeria),
-        ("International Remote", "Remote", params_remote),
+        (
+            "Nigeria",
+            "Nigeria",
+            {
+                "engine": "google_jobs",
+                "q": nigeria_query,
+                "location": "Nigeria",
+                "hl": "en",
+                "api_key": key,
+            },
+            None,
+        )
     ]
 
-    for requested_market, search_location, params in searches:
+    if include_international_remote:
+        searches.append(
+            (
+                "International Remote",
+                "Remote",
+                {
+                    "engine": "google_jobs",
+                    "q": remote_query,
+                    "ltype": "1",
+                    "hl": "en",
+                    "api_key": key,
+                },
+                remote_limit,
+            )
+        )
+
+    google_jobs = []
+
+    for requested_market, search_location, params, result_limit in searches:
         try:
             print(f"  ├─ Querying Google Jobs ({requested_market})...")
             search = GoogleSearch(params)
             results = search.get_dict().get("jobs_results", [])
+
+            if result_limit is not None:
+                results = results[:result_limit]
 
             for item in results:
                 link = item.get("share_link")
@@ -275,41 +292,3 @@ def fetch_google_jobs(api_key=None):
             )
 
     return google_jobs
-
-
-def fetch_all_jobs(linkedin_keywords=None):
-    """Run both scrapers with Nigeria first and remote jobs second."""
-    if linkedin_keywords is None:
-        linkedin_keywords = ["Solar Engineer", "Power Systems Engineer"]
-
-    aggregated_jobs = []
-
-    print("[1/3] Scraping LinkedIn Nigeria listings...")
-    for keyword in linkedin_keywords:
-        scraped = fetch_linkedin_jobs(
-            keyword,
-            location="Nigeria",
-            max_results=30,
-            market="Nigeria",
-        )
-        aggregated_jobs.extend(scraped)
-
-    print("[2/3] Scraping secondary LinkedIn remote listings...")
-    for keyword in linkedin_keywords:
-        scraped = fetch_linkedin_jobs(
-            keyword,
-            location="Remote",
-            max_results=10,
-            market="International Remote",
-            remote_only=True,
-        )
-        aggregated_jobs.extend(scraped)
-
-    print("[3/3] Fetching Google Jobs listings...")
-    aggregated_jobs.extend(fetch_google_jobs())
-
-    # Make local opportunities deterministic and first in downstream processing.
-    aggregated_jobs.sort(key=lambda job: job.get("Priority", 99))
-
-    print(f"Total raw jobs collected: {len(aggregated_jobs)}")
-    return aggregated_jobs
