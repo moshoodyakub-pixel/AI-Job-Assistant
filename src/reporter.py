@@ -1,5 +1,7 @@
 import html
 import os
+import tempfile
+import threading
 from datetime import datetime
 from urllib.parse import urlparse
 
@@ -22,23 +24,43 @@ def _safe_link(value):
     return "#"
 
 
-def generate_daily_report(analyzed_csv_path):
-    if not analyzed_csv_path or not os.path.exists(analyzed_csv_path):
+def _delete_later(path, delay_seconds=120):
+    def cleanup():
+        try:
+            if os.path.exists(path):
+                os.remove(path)
+        except OSError:
+            pass
+
+    timer = threading.Timer(delay_seconds, cleanup)
+    timer.daemon = True
+    timer.start()
+
+
+def generate_daily_report(analyzed_df):
+    """
+    Build the HTML report from an in-memory DataFrame.
+
+    A temporary HTML file is created only so Windows can open it in the default
+    browser. It is scheduled for automatic deletion shortly afterwards and is
+    not stored in the project or reports directory.
+    """
+    if analyzed_df is None or analyzed_df.empty:
         print("No analyzed data found to generate a report.")
-        return
+        return None
 
     print("\n--- Generating Daily HTML Dashboard ---")
-    df = pd.read_csv(analyzed_csv_path)
-
-    reports_dir = "reports"
-    os.makedirs(reports_dir, exist_ok=True)
+    df = analyzed_df.copy()
 
     date_str = datetime.now().strftime("%Y-%m-%d")
-    report_filename = f"Job_Report_{date_str}.html"
-    report_path = os.path.join(reports_dir, report_filename)
-
-    nigeria_count = int((df.get("Market", pd.Series(dtype=str)) == "Nigeria").sum()) if "Market" in df.columns else 0
-    remote_count = int((df.get("Market", pd.Series(dtype=str)) == "International Remote").sum()) if "Market" in df.columns else 0
+    nigeria_count = (
+        int((df["Market"] == "Nigeria").sum()) if "Market" in df.columns else 0
+    )
+    remote_count = (
+        int((df["Market"] == "International Remote").sum())
+        if "Market" in df.columns
+        else 0
+    )
 
     html_content = f"""
     <!DOCTYPE html>
@@ -68,7 +90,8 @@ def generate_daily_report(analyzed_csv_path):
             <strong>Date:</strong> {date_str}<br>
             <strong>Total Roles Evaluated:</strong> {len(df)}<br>
             <strong>Nigeria Roles:</strong> {nigeria_count}<br>
-            <strong>International Remote Roles:</strong> {remote_count}
+            <strong>International Remote Roles:</strong> {remote_count}<br>
+            <strong>Storage:</strong> Temporary report only — no project data saved permanently
         </div>
     """
 
@@ -118,10 +141,24 @@ def generate_daily_report(analyzed_csv_path):
     </html>
     """
 
-    with open(report_path, "w", encoding="utf-8") as file:
-        file.write(html_content)
+    temp_file = tempfile.NamedTemporaryFile(
+        mode="w",
+        suffix=".html",
+        prefix="ai_job_report_",
+        delete=False,
+        encoding="utf-8",
+    )
+    try:
+        temp_file.write(html_content)
+        temp_path = temp_file.name
+    finally:
+        temp_file.close()
 
-    print(f"Report successfully generated at: {report_path}")
+    print("Temporary report created for browser display only.")
+    print("It will be automatically deleted after about 2 minutes.")
 
     if hasattr(os, "startfile"):
-        os.startfile(report_path)
+        os.startfile(temp_path)
+
+    _delete_later(temp_path, delay_seconds=120)
+    return temp_path
