@@ -1,72 +1,59 @@
-import os
-import glob
+import re
+
 import pandas as pd
-from datetime import datetime
 
-MASTER_FILE = os.path.join("data", "master_jobs.csv")
 
-def load_existing_links():
-    """
-    Scans the data directory for existing CSV files and returns a set of all previously scraped job links.
-    """
-    seen_links = set()
-    
-    # Check all CSV files inside the data folder
-    for file_path in glob.glob(os.path.join("data", "*.csv")):
-        try:
-            df = pd.read_csv(file_path)
-            if 'Link' in df.columns:
-                seen_links.update(df['Link'].dropna().tolist())
-        except Exception:
-            continue
-            
-    return seen_links
+def _normalise_text(value):
+    text = "" if pd.isna(value) else str(value).strip().lower()
+    return re.sub(r"\s+", " ", text)
 
-def save_jobs_to_csv(jobs, filename_prefix="linkedin_jobs"):
+
+def _dedupe_key(row):
     """
-    Saves ONLY new, unseen jobs to a master database and a timestamped batch file.
+    Prefer a real URL as the duplicate key. If a source does not provide a
+    usable URL, fall back to title + company + location.
+    """
+    link = _normalise_text(row.get("Link"))
+    if link and link not in {"n/a", "#", "none"}:
+        return f"url::{link}"
+
+    title = _normalise_text(row.get("Title"))
+    company = _normalise_text(row.get("Company"))
+    location = _normalise_text(row.get("Location"))
+    return f"job::{title}|{company}|{location}"
+
+
+def prepare_jobs(jobs):
+    """
+    Prepare scraped jobs entirely in memory.
+
+    No CSV files, master database, reports, or historical job records are
+    written to disk. Duplicate removal therefore applies only to the current
+    run.
     """
     if not jobs:
         print("No raw jobs collected.")
         return None
 
-    os.makedirs("data", exist_ok=True)
-
-    # 1. Fetch all historically collected job links
-    seen_links = load_existing_links()
-    if seen_links:
-        print(f"Database contains {len(seen_links)} historical job link(s).")
-
-    # 2. Convert incoming raw jobs into a DataFrame and remove intra-batch duplicates
-    df_new = pd.DataFrame(jobs)
-    df_new.drop_duplicates(subset=['Link'], inplace=True)
-
-    # 3. Filter out jobs that have already been saved in past runs
-    initial_count = len(df_new)
-    df_new = df_new[~df_new['Link'].isin(seen_links)]
-    new_count = len(df_new)
-    duplicates_filtered = initial_count - new_count
-
-    if duplicates_filtered > 0:
-        print(f"Filtered out {duplicates_filtered} duplicate job(s) from previous runs.")
-
-    if df_new.empty:
-        print("No new unique jobs found during this run.")
+    df = pd.DataFrame(jobs)
+    if df.empty:
+        print("No raw jobs collected.")
         return None
 
-    # 4. Save timestamped batch file (contains ONLY new listings for the AI matcher)
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    batch_file_path = os.path.join("data", f"{filename_prefix}_{timestamp}.csv")
-    df_new.to_csv(batch_file_path, index=False)
+    df["_dedupe_key"] = df.apply(_dedupe_key, axis=1)
+    initial_count = len(df)
+    df = df.drop_duplicates(subset=["_dedupe_key"], keep="first").copy()
+    df.drop(columns=["_dedupe_key"], inplace=True)
 
-    # 5. Append new listings to master_jobs.csv
-    if os.path.exists(MASTER_FILE):
-        df_new.to_csv(MASTER_FILE, mode='a', header=False, index=False)
-    else:
-        df_new.to_csv(MASTER_FILE, index=False)
+    duplicates_filtered = initial_count - len(df)
+    if duplicates_filtered:
+        print(f"Filtered {duplicates_filtered} duplicate job(s) from this run.")
 
-    print(f"Successfully saved {new_count} NEW unique job(s):")
-    print(f"  └─ Batch file:  {batch_file_path}")
-    print(f"  └─ Master record: {MASTER_FILE}")
-    
-    return batch_file_path
+    if "Priority" in df.columns:
+        df["Priority"] = pd.to_numeric(df["Priority"], errors="coerce").fillna(99)
+        df = df.sort_values(by="Priority", ascending=True)
+
+    df.reset_index(drop=True, inplace=True)
+
+    print(f"Prepared {len(df)} unique job(s) in memory. Nothing was saved to disk.")
+    return df
