@@ -2,3 +2,10 @@ venv/
 .env
 __pycache__/
 *.pyc
+
+data/
+reports/
+*.log
+debug_log.txt
+desktop.ini
+AI-Job-Assistant-Review.zip
