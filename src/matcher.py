@@ -1,5 +1,4 @@
 import json
-import os
 import time
 
 import pandas as pd
@@ -19,7 +18,6 @@ ENGINEERING_PROFILE = """
 
 
 def _clean_value(value, max_chars=None):
-    """Convert DataFrame values to safe prompt text and optionally truncate them."""
     if pd.isna(value):
         text = ""
     else:
@@ -30,17 +28,17 @@ def _clean_value(value, max_chars=None):
     return text
 
 
-def evaluate_jobs_with_gemini(batch_file_path):
-    if not batch_file_path or not os.path.exists(batch_file_path):
-        print("No valid batch file provided for AI matching.")
+def evaluate_jobs_with_gemini(jobs_df):
+    """
+    Evaluate all jobs directly from an in-memory DataFrame and return another
+    DataFrame. No analyzed CSV is written to disk.
+    """
+    if jobs_df is None or jobs_df.empty:
+        print("No jobs available for AI matching.")
         return None
 
     print("\n--- Starting AI Job Matching ---")
-    df = pd.read_csv(batch_file_path)
-
-    if df.empty:
-        print("The batch file contains no jobs to evaluate.")
-        return None
+    df = jobs_df.copy()
 
     try:
         client = genai.Client()
@@ -64,7 +62,11 @@ def evaluate_jobs_with_gemini(batch_file_path):
         link = _clean_value(row.get("Link"))
 
         if not description:
-            description = "No job description was captured by the source. Evaluate conservatively using the available metadata and lower confidence where appropriate."
+            description = (
+                "No job description was captured by the source. Evaluate "
+                "conservatively using the available metadata and lower confidence "
+                "where appropriate."
+            )
 
         prompt = f"""
 Act as an expert technical recruiter in renewable energy, electrical power systems, solar, and mini-grid engineering.
@@ -159,8 +161,6 @@ Rules:
             f"[{position}/{total_jobs}] Analyzed: {title} at {company} "
             f"({location}) -> Score: {score}/10"
         )
-
-        # Small pause reduces burst-rate errors when processing a large batch.
         time.sleep(0.5)
 
     if not analyzed_jobs:
@@ -170,19 +170,12 @@ Rules:
     results_df["Priority"] = pd.to_numeric(
         results_df["Priority"], errors="coerce"
     ).fillna(99)
-
-    # Nigeria/primary-market jobs remain ahead of secondary international jobs,
-    # while the best matches are ranked first inside each market bucket.
     results_df = results_df.sort_values(
-        by=["Priority", "Match Score"],
-        ascending=[True, False],
-    )
-
-    output_file = batch_file_path.replace(".csv", "_analyzed.csv")
-    results_df.to_csv(output_file, index=False)
+        by=["Priority", "Match Score"], ascending=[True, False]
+    ).reset_index(drop=True)
 
     print(
         f"\nAI Matching complete! Evaluated {len(results_df)} of {total_jobs} jobs."
     )
-    print(f"Ranked jobs saved to: {output_file}")
-    return output_file
+    print("Analyzed results kept in memory only; no CSV was saved.")
+    return results_df
