@@ -17,9 +17,6 @@ ENGINEERING_PROFILE = """
 - Renewable-energy, solar, distribution-network, and power-system engineering experience.
 """.strip()
 
-# The current free-tier error reported a 5-request/minute Gemini quota.
-# Ten jobs per request dramatically reduces API calls, and 15 seconds between
-# requests keeps the client comfortably below that rate.
 BATCH_SIZE = 10
 MIN_REQUEST_INTERVAL_SECONDS = 15
 MAX_RETRIES = 3
@@ -37,14 +34,11 @@ def _clean_value(value, max_chars=None):
 
 
 def _retry_delay_from_error(exc, default_seconds=60):
-    """Extract Gemini's suggested retry delay from a 429 error when present."""
     message = str(exc)
-
     patterns = [
         r"Please retry in\s+([0-9.]+)s",
         r"retryDelay['\"]?\s*:\s*['\"]([0-9.]+)s",
     ]
-
     for pattern in patterns:
         match = re.search(pattern, message, flags=re.IGNORECASE)
         if match:
@@ -52,20 +46,43 @@ def _retry_delay_from_error(exc, default_seconds=60):
                 return max(float(match.group(1)) + 2, MIN_REQUEST_INTERVAL_SECONDS)
             except ValueError:
                 pass
-
     return max(default_seconds, MIN_REQUEST_INTERVAL_SECONDS)
 
 
 def _wait_for_rate_limit(last_request_time):
-    """Ensure successive Gemini calls stay safely under the request/minute cap."""
     if last_request_time is None:
         return
-
     elapsed = time.monotonic() - last_request_time
     remaining = MIN_REQUEST_INTERVAL_SECONDS - elapsed
     if remaining > 0:
         print(f"  Rate-limit pacing: waiting {remaining:.1f}s before next Gemini request...")
         time.sleep(remaining)
+
+
+def _fallback_score(row):
+    """
+    Transparent deterministic fallback used only when Gemini cannot score a job.
+    It converts the existing pre-AI relevance score into a conservative 1-10
+    match estimate rather than reporting an API failure as 0/10.
+    """
+    try:
+        pre_score = float(row.get("PreAI Score", 0))
+    except (TypeError, ValueError):
+        pre_score = 0
+
+    if pre_score >= 45:
+        return 9
+    if pre_score >= 38:
+        return 8
+    if pre_score >= 32:
+        return 7
+    if pre_score >= 27:
+        return 6
+    if pre_score >= 23:
+        return 5
+    if pre_score >= 20:
+        return 4
+    return 3
 
 
 def _build_job_payload(row, job_id):
@@ -91,7 +108,6 @@ def _build_job_payload(row, job_id):
 
 def _build_batch_prompt(job_payloads):
     jobs_json = json.dumps(job_payloads, ensure_ascii=False, indent=2)
-
     return f"""
 Act as an expert technical recruiter in renewable energy, electrical power systems, solar, and mini-grid engineering.
 
@@ -113,18 +129,11 @@ Rules:
 5. Penalize roles that are mainly mechanical, sales, business development, software/IT, telecom, or another discipline unless the listing clearly overlaps the candidate's power/renewable-energy expertise.
 6. If the description is missing or vague, do not invent requirements. State that confidence is lower.
 7. Keep each reasoning concise and evidence-based.
-8. Preserve the exact integer job_id so the results can be matched back to the correct job.
+8. Preserve the exact integer job_id so results map back to the correct listing.
 """
 
 
 def evaluate_jobs_with_gemini(jobs_df):
-    """
-    Evaluate all jobs from an in-memory DataFrame.
-
-    Jobs are evaluated in batches rather than one API request per job. This
-    reduces API usage substantially and prevents the free-tier 5 RPM quota from
-    being exhausted during normal runs. No CSV is written to disk.
-    """
     if jobs_df is None or jobs_df.empty:
         print("No jobs available for AI matching.")
         return None
@@ -135,8 +144,8 @@ def evaluate_jobs_with_gemini(jobs_df):
     try:
         client = genai.Client()
     except Exception as exc:
-        print(f"Failed to initialize Gemini Client. Check your API key. Error: {exc}")
-        return None
+        print(f"Failed to initialize Gemini Client. Falling back to local ranking. Error: {exc}")
+        client = None
 
     total_jobs = len(df)
     total_batches = (total_jobs + BATCH_SIZE - 1) // BATCH_SIZE
@@ -144,7 +153,7 @@ def evaluate_jobs_with_gemini(jobs_df):
     last_request_time = None
 
     print(
-        f"Evaluating ALL {total_jobs} jobs in {total_batches} Gemini batch(es) "
+        f"Evaluating {total_jobs} shortlisted job(s) in {total_batches} batch(es) "
         f"of up to {BATCH_SIZE} jobs each...\n"
     )
 
@@ -163,110 +172,84 @@ def evaluate_jobs_with_gemini(jobs_df):
 
     for batch_number, start in enumerate(range(0, total_jobs, BATCH_SIZE), start=1):
         batch_df = df.iloc[start : start + BATCH_SIZE]
-        payloads = [
-            _build_job_payload(row, int(job_id))
-            for job_id, row in batch_df.iterrows()
-        ]
+        payloads = [_build_job_payload(row, int(job_id)) for job_id, row in batch_df.iterrows()]
         prompt = _build_batch_prompt(payloads)
 
         result_data = None
         last_error = None
 
-        for attempt in range(1, MAX_RETRIES + 1):
-            _wait_for_rate_limit(last_request_time)
-
-            try:
-                print(
-                    f"Batch {batch_number}/{total_batches}: sending "
-                    f"{len(payloads)} job(s) to Gemini (attempt {attempt})..."
-                )
-                last_request_time = time.monotonic()
-
-                response = client.models.generate_content(
-                    model="gemini-2.5-flash",
-                    contents=prompt,
-                    config=types.GenerateContentConfig(
-                        temperature=0.2,
-                        response_mime_type="application/json",
-                        response_schema=response_schema,
-                    ),
-                )
-
-                parsed = json.loads(response.text)
-                if not isinstance(parsed, list):
-                    raise ValueError("Gemini batch response was not a JSON array.")
-
-                result_data = parsed
-                break
-
-            except Exception as exc:
-                last_error = exc
-                is_rate_limit = "429" in str(exc) or "RESOURCE_EXHAUSTED" in str(exc)
-
-                if attempt >= MAX_RETRIES:
-                    break
-
-                if is_rate_limit:
-                    wait_seconds = _retry_delay_from_error(exc)
+        if client is not None:
+            for attempt in range(1, MAX_RETRIES + 1):
+                _wait_for_rate_limit(last_request_time)
+                try:
                     print(
-                        f"  Gemini rate limit reached. Waiting {wait_seconds:.1f}s "
+                        f"Batch {batch_number}/{total_batches}: sending "
+                        f"{len(payloads)} job(s) to Gemini (attempt {attempt})..."
+                    )
+                    last_request_time = time.monotonic()
+                    response = client.models.generate_content(
+                        model="gemini-2.5-flash",
+                        contents=prompt,
+                        config=types.GenerateContentConfig(
+                            temperature=0.2,
+                            response_mime_type="application/json",
+                            response_schema=response_schema,
+                        ),
+                    )
+                    parsed = json.loads(response.text)
+                    if not isinstance(parsed, list):
+                        raise ValueError("Gemini batch response was not a JSON array.")
+                    result_data = parsed
+                    break
+                except Exception as exc:
+                    last_error = exc
+                    is_rate_limit = "429" in str(exc) or "RESOURCE_EXHAUSTED" in str(exc)
+                    if attempt >= MAX_RETRIES:
+                        break
+                    wait_seconds = (
+                        _retry_delay_from_error(exc)
+                        if is_rate_limit
+                        else max(5 * attempt, MIN_REQUEST_INTERVAL_SECONDS)
+                    )
+                    print(
+                        f"  Gemini request failed. Waiting {wait_seconds:.1f}s "
                         f"before retry {attempt + 1}/{MAX_RETRIES}..."
                     )
-                else:
-                    wait_seconds = max(5 * attempt, MIN_REQUEST_INTERVAL_SECONDS)
-                    print(
-                        f"  Gemini batch attempt {attempt} failed: {exc}\n"
-                        f"  Retrying in {wait_seconds:.1f}s..."
-                    )
-
-                time.sleep(wait_seconds)
-
-        if result_data is None:
-            print(
-                f"Batch {batch_number}/{total_batches} could not be analyzed after "
-                f"{MAX_RETRIES} attempts: {last_error}"
-            )
-            # Keep these jobs in the final report instead of silently dropping them.
-            for job_id, row in batch_df.iterrows():
-                analyzed_jobs.append(
-                    {
-                        "Title": _clean_value(row.get("Title")) or "Unknown Title",
-                        "Company": _clean_value(row.get("Company")) or "Unknown Company",
-                        "Location": _clean_value(row.get("Location")) or "Location not provided",
-                        "SearchLocation": _clean_value(row.get("SearchLocation")) or "Not recorded",
-                        "Market": _clean_value(row.get("Market")) or "Not classified",
-                        "Priority": row.get("Priority", 99),
-                        "WorkArrangement": _clean_value(row.get("WorkArrangement")) or "Unspecified",
-                        "Source": _clean_value(row.get("Source")) or "Unknown source",
-                        "Description": _clean_value(row.get("Description")),
-                        "Match Score": 0,
-                        "Reasoning": "AI evaluation unavailable because the Gemini API request failed after retries.",
-                        "Link": _clean_value(row.get("Link")),
-                    }
-                )
-            continue
+                    time.sleep(wait_seconds)
 
         results_by_id = {}
-        for item in result_data:
-            try:
-                results_by_id[int(item.get("job_id"))] = item
-            except (TypeError, ValueError, AttributeError):
-                continue
+        if result_data is not None:
+            for item in result_data:
+                try:
+                    results_by_id[int(item.get("job_id"))] = item
+                except (TypeError, ValueError, AttributeError):
+                    continue
+        elif last_error is not None:
+            print(
+                f"Batch {batch_number}/{total_batches} could not be AI-scored after retries. "
+                "Using local fallback scores instead."
+            )
 
         for job_id, row in batch_df.iterrows():
-            item = results_by_id.get(int(job_id), {})
+            item = results_by_id.get(int(job_id))
 
-            try:
-                score = int(item.get("match_score", 0))
-            except (TypeError, ValueError):
-                score = 0
-
-            if score:
-                score = max(1, min(10, score))
-
-            reasoning = str(item.get("reasoning", "")).strip()
-            if not reasoning:
-                reasoning = "Gemini did not return an evaluation for this job in the batch."
+            if item is not None:
+                try:
+                    score = int(item.get("match_score", 0))
+                except (TypeError, ValueError):
+                    score = 0
+                score = max(1, min(10, score)) if score else _fallback_score(row)
+                reasoning = str(item.get("reasoning", "")).strip()
+                if not reasoning:
+                    reasoning = "AI score returned without detailed reasoning."
+                evaluation_status = "AI"
+            else:
+                score = _fallback_score(row)
+                reasoning = (
+                    "Fallback relevance score used because the Gemini API was unavailable or quota-limited. "
+                    "This score is based on title/description keyword alignment and Nigeria-market priority."
+                )
+                evaluation_status = "Fallback"
 
             analyzed_jobs.append(
                 {
@@ -279,32 +262,27 @@ def evaluate_jobs_with_gemini(jobs_df):
                     "WorkArrangement": _clean_value(row.get("WorkArrangement")) or "Unspecified",
                     "Source": _clean_value(row.get("Source")) or "Unknown source",
                     "Description": _clean_value(row.get("Description")),
+                    "PreAI Score": row.get("PreAI Score", 0),
                     "Match Score": score,
+                    "Evaluation Status": evaluation_status,
                     "Reasoning": reasoning,
                     "Link": _clean_value(row.get("Link")),
                 }
             )
 
             print(
-                f"[{job_id + 1}/{total_jobs}] Analyzed: "
-                f"{_clean_value(row.get('Title')) or 'Unknown Title'} -> {score}/10"
+                f"[{job_id + 1}/{total_jobs}] {_clean_value(row.get('Title')) or 'Unknown Title'} "
+                f"-> {score}/10 ({evaluation_status})"
             )
 
-    if not analyzed_jobs:
-        return None
-
     results_df = pd.DataFrame(analyzed_jobs)
-    results_df["Priority"] = pd.to_numeric(
-        results_df["Priority"], errors="coerce"
-    ).fillna(99)
+    results_df["Priority"] = pd.to_numeric(results_df["Priority"], errors="coerce").fillna(99)
     results_df = results_df.sort_values(
         by=["Priority", "Match Score"], ascending=[True, False]
     ).reset_index(drop=True)
 
-    successful_count = int((results_df["Match Score"] > 0).sum())
-    print(
-        f"\nAI Matching complete! {successful_count}/{total_jobs} jobs received "
-        "an AI score."
-    )
-    print("Analyzed results kept in memory only; no CSV was saved.")
+    ai_count = int((results_df["Evaluation Status"] == "AI").sum())
+    fallback_count = int((results_df["Evaluation Status"] == "Fallback").sum())
+    print(f"\nMatching complete: {ai_count} AI-scored, {fallback_count} fallback-scored.")
+    print("Results kept in memory only; no CSV was saved.")
     return results_df
