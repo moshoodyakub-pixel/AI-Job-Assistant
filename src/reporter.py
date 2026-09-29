@@ -38,13 +38,6 @@ def _delete_later(path, delay_seconds=120):
 
 
 def generate_daily_report(analyzed_df):
-    """
-    Build the HTML report from an in-memory DataFrame.
-
-    A temporary HTML file is created only so Windows can open it in the default
-    browser. It is scheduled for automatic deletion shortly afterwards and is
-    not stored in the project or reports directory.
-    """
     if analyzed_df is None or analyzed_df.empty:
         print("No analyzed data found to generate a report.")
         return None
@@ -53,14 +46,10 @@ def generate_daily_report(analyzed_df):
     df = analyzed_df.copy()
 
     date_str = datetime.now().strftime("%Y-%m-%d")
-    nigeria_count = (
-        int((df["Market"] == "Nigeria").sum()) if "Market" in df.columns else 0
-    )
-    remote_count = (
-        int((df["Market"] == "International Remote").sum())
-        if "Market" in df.columns
-        else 0
-    )
+    nigeria_count = int((df["Market"] == "Nigeria").sum()) if "Market" in df.columns else 0
+    remote_count = int((df["Market"] == "International Remote").sum()) if "Market" in df.columns else 0
+    ai_count = int((df["Evaluation Status"] == "AI").sum()) if "Evaluation Status" in df.columns else 0
+    fallback_count = int((df["Evaluation Status"] == "Fallback").sum()) if "Evaluation Status" in df.columns else 0
 
     html_content = f"""
     <!DOCTYPE html>
@@ -79,6 +68,8 @@ def generate_daily_report(analyzed_df):
             .company {{ font-size: 1.1em; font-style: italic; color: #7f8c8d; margin-bottom: 10px; }}
             .meta {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 8px 20px; margin-bottom: 15px; font-size: 0.95em; color: #555; }}
             .tag {{ display: inline-block; padding: 3px 8px; border-radius: 4px; background: #eef3f7; }}
+            .ai-tag {{ background: #e8f6ef; color: #1e8449; }}
+            .fallback-tag {{ background: #fff3cd; color: #856404; }}
             .reasoning {{ background-color: #f8f9fa; padding: 15px; border-left: 4px solid #f39c12; font-size: 1em; color: #444; border-radius: 0 4px 4px 0; }}
             .apply-btn {{ display: inline-block; margin-top: 20px; padding: 12px 20px; background-color: #2980b9; color: white; text-decoration: none; border-radius: 5px; font-weight: bold; transition: background 0.3s; }}
             .apply-btn:hover {{ background-color: #1a5276; }}
@@ -88,9 +79,11 @@ def generate_daily_report(analyzed_df):
         <h1>Daily Job Intelligence Report</h1>
         <div class="summary">
             <strong>Date:</strong> {date_str}<br>
-            <strong>Total Roles Evaluated:</strong> {len(df)}<br>
+            <strong>Total Roles Ranked:</strong> {len(df)}<br>
             <strong>Nigeria Roles:</strong> {nigeria_count}<br>
             <strong>International Remote Roles:</strong> {remote_count}<br>
+            <strong>AI-scored:</strong> {ai_count}<br>
+            <strong>Fallback-scored:</strong> {fallback_count}<br>
             <strong>Storage:</strong> Temporary report only — no project data saved permanently
         </div>
     """
@@ -103,6 +96,7 @@ def generate_daily_report(analyzed_df):
         work_arrangement = _safe_text(row.get("WorkArrangement"), "Unspecified")
         source = _safe_text(row.get("Source"), "Unknown source")
         reasoning = _safe_text(row.get("Reasoning"), "No reasoning provided.")
+        evaluation_status = _safe_text(row.get("Evaluation Status"), "Unknown")
         link = _safe_link(row.get("Link", "#"))
         score = row.get("Match Score", 0)
 
@@ -118,6 +112,8 @@ def generate_daily_report(analyzed_df):
         else:
             score_color = "#e74c3c"
 
+        status_class = "ai-tag" if evaluation_status == "AI" else "fallback-tag"
+
         html_content += f"""
         <div class="job-card" style="border-left-color: {score_color};">
             <div class="job-header">
@@ -130,8 +126,9 @@ def generate_daily_report(analyzed_df):
                 <div><strong>Market:</strong> <span class="tag">{market}</span></div>
                 <div><strong>Work Arrangement:</strong> {work_arrangement}</div>
                 <div><strong>Source:</strong> {source}</div>
+                <div><strong>Scoring:</strong> <span class="tag {status_class}">{evaluation_status}</span></div>
             </div>
-            <div class="reasoning"><strong>AI Evaluation:</strong><br>{reasoning}</div>
+            <div class="reasoning"><strong>Evaluation:</strong><br>{reasoning}</div>
             <a href="{link}" class="apply-btn" target="_blank" rel="noopener noreferrer">View Application</a>
         </div>
         """
